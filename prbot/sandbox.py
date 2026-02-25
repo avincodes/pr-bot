@@ -1,7 +1,8 @@
-"""Sandboxed shell execution (workdir + timeout).
+"""Sandboxed shell execution.
 
-First cut: just pins execution to a working directory and enforces a
-wall-clock timeout. Allowlisting and path-escape protection come next.
+Adds a command allowlist on top of the workdir+timeout runner. The
+first token of any argv must be in ALLOWED_COMMANDS or the sandbox
+refuses to run.
 """
 
 from __future__ import annotations
@@ -10,7 +11,25 @@ import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Iterable, Sequence
+
+ALLOWED_COMMANDS: frozenset[str] = frozenset(
+    {
+        "python",
+        "python3",
+        "pytest",
+        "ls",
+        "cat",
+        "grep",
+        "rg",
+        "git",
+        "gh",
+        "echo",
+        "pwd",
+        "true",
+        "false",
+    }
+)
 
 
 class SandboxError(RuntimeError):
@@ -30,15 +49,30 @@ class SandboxResult:
 
 
 class Sandbox:
-    def __init__(self, workdir: str | os.PathLike[str], *, timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        workdir: str | os.PathLike[str],
+        *,
+        allowed: Iterable[str] = ALLOWED_COMMANDS,
+        timeout: float = 30.0,
+    ) -> None:
         self.workdir = Path(workdir).resolve()
         if not self.workdir.is_dir():
             raise SandboxError(f"workdir does not exist: {self.workdir}")
+        self.allowed = frozenset(allowed)
         self.timeout = timeout
 
     def run(self, argv: Sequence[str], *, timeout: float | None = None) -> SandboxResult:
         if not argv:
             raise SandboxError("empty command")
+        head = os.path.basename(argv[0])
+        normalized = head
+        if head.startswith("python"):
+            normalized = "python3" if head.startswith("python3") else "python"
+        if normalized not in self.allowed and head not in self.allowed:
+            raise SandboxError(
+                f"command {head!r} not in allowlist {sorted(self.allowed)}"
+            )
         try:
             proc = subprocess.run(
                 list(argv),
