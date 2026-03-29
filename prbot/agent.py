@@ -1,7 +1,8 @@
-"""The agent loop: planner -> executor.
+"""The agent loop: planner -> executor -> critic -> repair.
 
-First cut: produce a plan, then step through tool calls until a
-fixed iteration cap. No critic, no repair, no token budget yet.
+The critic reads the most recent tool result and decides whether the
+run is done, needs another step, or should push a repair hint back
+into the history for the executor to react to.
 """
 
 from __future__ import annotations
@@ -29,9 +30,18 @@ EXECUTOR_SYSTEM = (
     "list_dir, grep, run_tests, git_diff, git_commit, gh_open_pr."
 )
 
+CRITIC_SYSTEM = (
+    "You are the critic module of an autonomous coding agent. "
+    "Read the most recent tool result and decide whether the plan is "
+    "complete. Output JSON with keys `decision` (one of approve, "
+    "continue, repair) and `summary` (string). If repair, include "
+    "`hint` with a short instruction for the executor."
+)
+
 
 @dataclass
 class RunResult:
+    approved: bool
     iterations: int
     plan: dict[str, Any]
     history: list[dict[str, Any]]
@@ -39,7 +49,7 @@ class RunResult:
 
 
 class Agent:
-    MAX_ITERS = 8
+    MAX_ITERS = 12
 
     def __init__(self, llm: LLMClient, tools: Toolbox, tracer: TraceLogger) -> None:
         self.llm = llm
@@ -73,6 +83,18 @@ class Agent:
         self.tracer.emit("tool_call", tool=step.get("tool"), args=step.get("args", {}))
         return step
 
+    def critique(
+        self,
+        plan: dict[str, Any],
+        history: list[dict[str, Any]],
+        last_result: dict[str, Any],
+    ) -> dict[str, Any]:
+        user = json.dumps({"plan": plan, "history": history[-4:], "last": last_result})
+        resp = self._ask(CRITIC_SYSTEM, user, event="critic_request")
+        decision = self._parse_json(resp.text)
+        self.tracer.emit("critic_decision", decision=decision)
+        return decision
+
     def run(self, issue: str) -> RunResult:
         layout = sorted(
             p.relative_to(self.tools.sandbox.workdir).as_posix()
@@ -82,17 +104,31 @@ class Agent:
         self.tracer.emit("run_start", issue=issue, layout=layout[:50])
         plan = self.plan(issue, layout[:50])
         history: list[dict[str, Any]] = []
+        approved = False
 
         for i in range(self.MAX_ITERS):
             step = self.next_step(plan, history)
             tool = step.get("tool", "")
             args = step.get("args", {}) or {}
             result = self.tools.call(tool, args)
+            result_json = result.to_json()
             self.tracer.emit("tool_result", tool=tool, ok=result.ok, data=result.data)
-            history.append({"tool": tool, "args": args, "result": result.to_json()})
+            history.append({"tool": tool, "args": args, "result": result_json})
 
-        self.tracer.emit("run_end", iterations=len(history))
+            decision = self.critique(plan, history, result_json)
+            verdict = (decision.get("decision") or "").lower()
+            if verdict == "approve":
+                approved = True
+                break
+            if verdict == "repair":
+                hint = decision.get("hint", "repair requested")
+                history.append({"repair_hint": hint})
+                self.tracer.emit("repair", hint=hint)
+                continue
+
+        self.tracer.emit("run_end", approved=approved, iterations=len(history))
         return RunResult(
+            approved=approved,
             iterations=len(history),
             plan=plan,
             history=history,
