@@ -1,14 +1,29 @@
 """The agent loop: planner -> executor -> critic -> repair.
 
-The critic reads the most recent tool result and decides whether the
-run is done, needs another step, or should push a repair hint back
-into the history for the executor to react to.
+Design notes
+------------
+The loop is intentionally small and observable. Each iteration the
+agent produces one tool call, we run it, and the critic decides whether
+we are done, should take another step, or need to repair a failure.
+
+  plan  -> steps[]
+  while not done and iters < cap and tokens < budget:
+      step = executor.choose_next(plan, history)
+      result = tools.call(step.tool, step.args)
+      critic = critic.review(plan, history, result)
+      if critic == approve: break
+      if critic == repair: push repair hint into history
+      if critic == continue: loop
+
+The planner/executor/critic are three calls to the same
+:class:`LLMClient`, distinguished by the system prompt so the scripted
+client can route them to different response queues.
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -40,25 +55,48 @@ CRITIC_SYSTEM = (
 
 
 @dataclass
+class RunConfig:
+    max_iters: int = 12
+    token_budget: int = 50_000
+
+
+@dataclass
 class RunResult:
     approved: bool
     iterations: int
+    tokens_in: int
+    tokens_out: int
     plan: dict[str, Any]
     history: list[dict[str, Any]]
     trace_path: Path
 
 
 class Agent:
-    MAX_ITERS = 12
-
-    def __init__(self, llm: LLMClient, tools: Toolbox, tracer: TraceLogger) -> None:
+    def __init__(
+        self,
+        llm: LLMClient,
+        tools: Toolbox,
+        tracer: TraceLogger,
+        config: RunConfig | None = None,
+    ) -> None:
         self.llm = llm
         self.tools = tools
         self.tracer = tracer
+        self.config = config or RunConfig()
+        self.tokens_in = 0
+        self.tokens_out = 0
 
+    # ------------------------------------------------------------------
     def _ask(self, system: str, user: str, *, event: str) -> LLMResponse:
         resp = self.llm.complete(system, user)
-        self.tracer.emit(event, text=resp.text)
+        self.tokens_in += resp.tokens_in
+        self.tokens_out += resp.tokens_out
+        self.tracer.emit(
+            event,
+            tokens_in=resp.tokens_in,
+            tokens_out=resp.tokens_out,
+            text=resp.text,
+        )
         return resp
 
     def _parse_json(self, text: str) -> dict[str, Any]:
@@ -69,6 +107,7 @@ class Agent:
                 text = text[4:]
         return json.loads(text)
 
+    # ------------------------------------------------------------------
     def plan(self, issue: str, layout: list[str]) -> dict[str, Any]:
         user = json.dumps({"issue": issue, "layout": layout})
         resp = self._ask(PLANNER_SYSTEM, user, event="plan_request")
@@ -95,6 +134,7 @@ class Agent:
         self.tracer.emit("critic_decision", decision=decision)
         return decision
 
+    # ------------------------------------------------------------------
     def run(self, issue: str) -> RunResult:
         layout = sorted(
             p.relative_to(self.tools.sandbox.workdir).as_posix()
@@ -106,7 +146,10 @@ class Agent:
         history: list[dict[str, Any]] = []
         approved = False
 
-        for i in range(self.MAX_ITERS):
+        for i in range(self.config.max_iters):
+            if self.tokens_in + self.tokens_out > self.config.token_budget:
+                self.tracer.emit("budget_exceeded", tokens=self.tokens_in + self.tokens_out)
+                break
             step = self.next_step(plan, history)
             tool = step.get("tool", "")
             args = step.get("args", {}) or {}
@@ -125,11 +168,20 @@ class Agent:
                 history.append({"repair_hint": hint})
                 self.tracer.emit("repair", hint=hint)
                 continue
+            # continue: take another step
 
-        self.tracer.emit("run_end", approved=approved, iterations=len(history))
+        self.tracer.emit(
+            "run_end",
+            approved=approved,
+            iterations=i + 1 if history else 0,
+            tokens_in=self.tokens_in,
+            tokens_out=self.tokens_out,
+        )
         return RunResult(
             approved=approved,
             iterations=len(history),
+            tokens_in=self.tokens_in,
+            tokens_out=self.tokens_out,
             plan=plan,
             history=history,
             trace_path=self.tracer.path,
