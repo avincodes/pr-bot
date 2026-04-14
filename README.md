@@ -7,7 +7,7 @@ opens a pull request when it is happy. The whole thing is under 2k
 lines of Python and has no third-party runtime dependencies in
 dry-run mode.
 
-It exists to make the agent loop itself legibile: every decision,
+It exists to make the agent loop itself legible: every decision,
 tool call, tool result, and critic verdict is written to a
 structured JSONL trace that you can replay or diff against a
 previous run.
